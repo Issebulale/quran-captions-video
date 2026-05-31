@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: quran-captions-video
+    runtime: docker
+    plan: free
+    healthCheckPath: /
+    envVars:
+      - key: PEXELS_API_KEY
+        sync: false
