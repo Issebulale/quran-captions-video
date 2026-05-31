@@ -92,7 +92,7 @@ async function renderOverlay({ arabic, translit, translation, W, H, out }) {
     executablePath: CHROME,
     headless: 'new',
     protocolTimeout: 120000,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
   try {
     const page = await browser.newPage();
