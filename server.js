@@ -88,23 +88,24 @@ async function renderOverlay({ arabic, translit, translation, W, H, out }) {
     ${translation ? `<div class="en">&ldquo;${esc(translation)}&rdquo;</div>` : ''}
   </div></body></html>`;
 
-    const browser = await puppeteer.launch({
-       executablePath: CHROME,
-       headless: 'new',
-       protocolTimeout: 120000,
-       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote'],
-     });
-     try {
-       const page = await browser.newPage();
-       page.setDefaultNavigationTimeout(0);
-       await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
-       await page.setContent(html, { waitUntil: 'load', timeout: 0 });
-       await page.evaluate(() => (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()));
-       await page.screenshot({ path: out, omitBackground: true });
-     } finally {
-       await browser.close();
-     }
+  const browser = await puppeteer.launch({
+    executablePath: CHROME,
+    headless: 'new',
+    protocolTimeout: 120000,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process', '--no-zygote'],
+  });
+  try {
+    const page = await browser.newPage();
+    page.setDefaultNavigationTimeout(0);
+    await page.setViewport({ width: W, height: H, deviceScaleFactor: 1 });
+    await page.setContent(html, { waitUntil: 'load', timeout: 0 });
+    await page.evaluate(() => (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve()));
+    await page.screenshot({ path: out, omitBackground: true });
+  } finally {
+    await browser.close();
   }
+}
+
 // ---------- routes ----------
 app.get('/', (_req, res) => res.send('Quran Captions video server is running.'));
 
