@@ -104,6 +104,7 @@ async function renderOverlay({ arabic, translit, translation, W, H, out }) {
      } finally {
        await browser.close();
      }
+  }
 // ---------- routes ----------
 app.get('/', (_req, res) => res.send('Quran Captions video server is running.'));
 
