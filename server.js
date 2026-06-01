@@ -108,13 +108,14 @@ async function renderOverlay({ arabic, translit, translation, W, H, out, arFacto
   }
 }
 
-// Build an ASS subtitle file from ready-made Dialogue lines and burn it over a
-// moving background (Pexels or gradient) together with the audio. Used for timed-block
-// captions (and word karaoke). No Chromium needed — libass shapes Arabic correctly.
-async function composeWithAss(dir, { W, H, color, position, fontSizePx, dialogues, audio, totalSec, background }) {
-  const align = position === 'top' ? 8 : position === 'bottom' ? 2 : 5;
-  const marginV = Math.round(H * 0.12);
-  const marginLR = Math.round(W * 0.07);
+// Build one ASS Style line.
+function assStyle(name, { fontSize, color, align, marginV, marginLR, italic = 0 }) {
+  return `Style: ${name},Amiri,${fontSize},${assColor(color)},&H50FFFFFF,&H00000000,&H78000000,0,${italic},0,0,100,100,0,0,1,3,1,${align},${marginLR},${marginLR},${marginV},1`;
+}
+
+// Build an ASS subtitle file from ready-made Style + Dialogue lines and burn it over a
+// moving background (Pexels or gradient) with the audio. libass shapes Arabic correctly.
+async function composeWithAss(dir, { W, H, stylesBlock, dialogues, audio, totalSec, background }) {
   const ass = `[Script Info]
 ScriptType: v4.00+
 PlayResX: ${W}
@@ -124,7 +125,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: AR,Amiri,${fontSizePx},${assColor(color)},&H50FFFFFF,&H00000000,&H78000000,0,0,0,0,100,100,0,0,1,3,1,${align},${marginLR},${marginLR},${marginV},1
+${stylesBlock}
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -223,8 +224,10 @@ app.post('/render', async (req, res) => {
       const audioS = path.join(dir, 'audio.mp3');
       await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', path.join(dir, 'list.txt'), '-c:a', 'libmp3lame', audioS]);
       const fontSizePx = Math.max(14, Math.round(W * (arFactor || 0.064)));
+      const align = position === 'top' ? 8 : position === 'bottom' ? 2 : 5;
+      const stylesBlock = assStyle('AR', { fontSize: fontSizePx, color, align, marginV: Math.round(H * 0.12), marginLR: Math.round(W * 0.07) });
       const out = await composeWithAss(dir, {
-        W, H, color, position, fontSizePx, dialogues,
+        W, H, stylesBlock, dialogues,
         audio: audioS, totalSec: Math.max(1, offMs / 1000), background,
       });
       const buf = await readFile(out);
@@ -317,8 +320,9 @@ function assTime(ms) {
 }
 
 // Fetch words + audio URL + word-timing segments for one ayah from Quran.com.
-async function fetchVerseTiming(recitationId, key) {
-  const url = `https://api.quran.com/api/v4/verses/by_key/${key}?words=true&word_fields=text_uthmani&audio=${recitationId}`;
+async function fetchVerseTiming(recitationId, key, withTranslation = false) {
+  const tr = withTranslation ? '&translations=20' : ''; // 20 = Saheeh International
+  const url = `https://api.quran.com/api/v4/verses/by_key/${key}?words=true&word_fields=text_uthmani&audio=${recitationId}${tr}`;
   const r = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!r.ok) throw new Error(`quran.com ${r.status} for ${key}`);
   const j = await r.json();
@@ -329,7 +333,10 @@ async function fetchVerseTiming(recitationId, key) {
   const audio = v.audio || {};
   const audioUrl = audio.url ? (String(audio.url).startsWith('http') ? audio.url : 'https://verses.quran.com/' + audio.url) : null;
   const segments = audio.segments || [];
-  return { words, audioUrl, segments };
+  const translation = (withTranslation && v.translations && v.translations[0])
+    ? String(v.translations[0].text).replace(/<[^>]*>/g, '').trim()
+    : '';
+  return { words, audioUrl, segments, translation };
 }
 
 app.post('/render-karaoke', async (req, res) => {
@@ -452,6 +459,110 @@ ${dialogues.join('\n')}
     const buf = await readFile(out);
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Disposition', 'attachment; filename="verse-karaoke.mp4"');
+    res.send(buf);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// ===================== PHRASE SEGMENTS (Quran Captions style) =====================
+// Groups each ayah's words into short phrases shown in time with the recitation,
+// large and centered, with the ayah translation underneath.
+app.post('/render-segments', async (req, res) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'qs-'));
+  try {
+    let {
+      recitationId = 7, verseKeys = [], background = 'nature',
+      width = 1080, height = 1920, color = '#ffffff', position = 'middle',
+      wordsPerSegment = 4, showTranslation = false,
+    } = req.body || {};
+    if (!Array.isArray(verseKeys) || verseKeys.length === 0) {
+      return res.status(400).json({ error: 'verseKeys is required' });
+    }
+    wordsPerSegment = Math.max(1, Math.min(8, parseInt(wordsPerSegment) || 4));
+
+    let W = Math.max(360, Math.min(1080, parseInt(width) || 1080));
+    let H = Math.max(360, Math.min(1920, parseInt(height) || 1920));
+    const long = Math.max(W, H);
+    if (long > MAX_LONG_SIDE) {
+      const k = MAX_LONG_SIDE / long;
+      W = Math.round((W * k) / 2) * 2;
+      H = Math.round((H * k) / 2) * 2;
+    }
+
+    const listLines = [];
+    const arDialogues = [];
+    const trDialogues = [];
+    let offMs = 0;
+
+    for (let i = 0; i < verseKeys.length; i++) {
+      const { words, audioUrl, segments, translation } = await fetchVerseTiming(recitationId, verseKeys[i], showTranslation);
+      if (!audioUrl) throw new Error(`no audio for ${verseKeys[i]} (try another reciter)`);
+      const f = path.join(dir, `a${i}.mp3`);
+      await download(audioUrl, f);
+      listLines.push(`file '${f}'`);
+      const durMs = (await probeDuration(f)) * 1000;
+
+      // per-word [start,end] relative to this ayah
+      const segByWord = {};
+      for (const s of segments) {
+        if (Array.isArray(s) && s.length >= 3 && s[0] >= 1) segByWord[s[0]] = [s[1], s[2]];
+      }
+      const n = words.length || 1;
+      const wt = words.map((w, wi) => {
+        let st, en;
+        if (segByWord[wi + 1]) { [st, en] = segByWord[wi + 1]; }
+        else { st = (durMs * wi) / n; en = (durMs * (wi + 1)) / n; }
+        return { w, st, en };
+      });
+
+      // group words into phrases (by count, or break on a long pause)
+      let group = [];
+      const flush = () => {
+        if (!group.length) return;
+        const st = group[0].st;
+        const en = group[group.length - 1].en;
+        const text = group.map((g) => g.w).join(' ');
+        arDialogues.push(`Dialogue: 0,${assTime(offMs + st)},${assTime(offMs + en)},AR,,0,0,0,,${assText(text)}`);
+        group = [];
+      };
+      for (let k = 0; k < wt.length; k++) {
+        group.push(wt[k]);
+        const gap = k + 1 < wt.length ? wt[k + 1].st - wt[k].en : 0;
+        if (group.length >= wordsPerSegment || gap > 600) flush();
+      }
+      flush();
+
+      if (showTranslation && translation) {
+        trDialogues.push(`Dialogue: 0,${assTime(offMs)},${assTime(offMs + durMs)},TR,,0,0,0,,${assText(translation)}`);
+      }
+      offMs += durMs;
+    }
+
+    await writeFile(path.join(dir, 'list.txt'), listLines.join('\n'));
+    const audio = path.join(dir, 'audio.mp3');
+    await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', path.join(dir, 'list.txt'), '-c:a', 'libmp3lame', audio]);
+
+    const arFont = Math.round(W * 0.092);
+    const trFont = Math.round(W * 0.034);
+    const arAlign = position === 'top' ? 8 : position === 'bottom' ? 2 : 5;
+    const arMarginV = showTranslation ? Math.round(H * 0.20) : Math.round(H * 0.12);
+    const stylesBlock = [
+      assStyle('AR', { fontSize: arFont, color, align: arAlign, marginV: arMarginV, marginLR: Math.round(W * 0.07) }),
+      assStyle('TR', { fontSize: trFont, color, align: 2, marginV: Math.round(H * 0.09), marginLR: Math.round(W * 0.08), italic: 1 }),
+    ].join('\n');
+
+    const out = await composeWithAss(dir, {
+      W, H, stylesBlock, dialogues: [...arDialogues, ...trDialogues],
+      audio, totalSec: Math.max(1, offMs / 1000), background,
+    });
+
+    const buf = await readFile(out);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="verse-segments.mp4"');
     res.send(buf);
   } catch (e) {
     console.error(e);
