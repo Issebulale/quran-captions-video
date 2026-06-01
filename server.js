@@ -19,8 +19,9 @@ const PEXELS_KEY = process.env.PEXELS_API_KEY; // optional; set in Render dashbo
 const PORT = process.env.PORT || 10000;
 const CHROME = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
 
-// Free-tier safety: cap the longest side so a render fits in memory/time.
-const MAX_LONG_SIDE = 1280;
+// Free-tier safety: cap the longest side so a render fits in 512MB memory.
+// If you upgrade the Render instance, you can raise this (e.g. 1280 or 1920).
+const MAX_LONG_SIDE = 960;
 
 // ---------- small helpers ----------
 function run(cmd, args) {
@@ -66,21 +67,22 @@ async function fetchPexels(query, orientation, dest) {
 }
 
 // Render the verse text to a transparent PNG using headless Chromium (reliable Arabic shaping).
-async function renderOverlay({ arabic, translit, translation, W, H, out }) {
+async function renderOverlay({ arabic, translit, translation, W, H, out, arFactor = 0.064, position = 'middle', color = '#ffffff' }) {
   const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const arSize = Math.round(W * 0.064);
-  const tlSize = Math.round(W * 0.03);
-  const enSize = Math.round(W * 0.038);
+  const arSize = Math.max(12, Math.round(W * arFactor));
+  const tlSize = Math.round(arSize * 0.46);
+  const enSize = Math.round(arSize * 0.6);
   const pad = Math.round(W * 0.085);
+  const justify = position === 'top' ? 'flex-start' : position === 'bottom' ? 'flex-end' : 'center';
   const html = `<!doctype html><html><head><meta charset="utf-8"><style>
     html,body{margin:0;padding:0;width:${W}px;height:${H}px;background:transparent;}
     .wrap{box-sizing:border-box;width:${W}px;height:${H}px;display:flex;flex-direction:column;
-      align-items:center;justify-content:center;text-align:center;padding:${pad}px;}
-    .ar{font-family:'Amiri',serif;direction:rtl;color:#fff;font-size:${arSize}px;line-height:1.95;
+      align-items:center;justify-content:${justify};text-align:center;padding:${pad}px;}
+    .ar{font-family:'Amiri',serif;direction:rtl;color:${color};font-size:${arSize}px;line-height:1.95;
       text-shadow:0 2px 22px rgba(0,0,0,.75);}
-    .tl{font-family:serif;font-style:italic;color:#f1e7d2;font-size:${tlSize}px;margin-top:${Math.round(W * 0.03)}px;
+    .tl{font-family:serif;font-style:italic;color:${color};opacity:.9;font-size:${tlSize}px;margin-top:${Math.round(W * 0.03)}px;
       text-shadow:0 2px 14px rgba(0,0,0,.85);}
-    .en{font-family:'Liberation Serif',serif;color:#fff;font-size:${enSize}px;margin-top:${Math.round(W * 0.025)}px;
+    .en{font-family:'Liberation Serif',serif;color:${color};font-size:${enSize}px;margin-top:${Math.round(W * 0.025)}px;
       line-height:1.45;text-shadow:0 2px 14px rgba(0,0,0,.85);}
   </style></head><body><div class="wrap">
     ${arabic ? `<div class="ar">${esc(arabic)}</div>` : ''}
@@ -116,6 +118,7 @@ app.post('/render', async (req, res) => {
       arabic = '', translit = '', translation = '',
       audioUrls = [], background = 'nature',
       width = 1080, height = 1920,
+      arFactor = 0.064, position = 'middle', color = '#ffffff',
     } = req.body || {};
 
     if (!Array.isArray(audioUrls) || audioUrls.length === 0) {
@@ -158,7 +161,7 @@ app.post('/render', async (req, res) => {
 
     // 3) verse overlay
     const textPng = path.join(dir, 'text.png');
-    await renderOverlay({ arabic, translit, translation, W, H, out: textPng });
+    await renderOverlay({ arabic, translit, translation, W, H, out: textPng, arFactor, position, color });
 
     // 4) composite
     const out = path.join(dir, 'out.mp4');
@@ -169,7 +172,7 @@ app.post('/render', async (req, res) => {
         `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,` +
           `drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.4:t=fill[b];[b][1:v]overlay=(W-w)/2:(H-h)/2[v]`,
         '-map', '[v]', '-map', '2:a', '-t', String(dur), '-r', '30',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out,
       ]);
     } else {
@@ -181,7 +184,7 @@ app.post('/render', async (req, res) => {
         '-filter_complex',
         `[0:v]drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.32:t=fill[b];[b][1:v]overlay=(W-w)/2:(H-h)/2[v]`,
         '-map', '[v]', '-map', '2:a', '-t', String(dur), '-r', '30',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
         '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out,
       ]);
     }
