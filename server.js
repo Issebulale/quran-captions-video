@@ -201,4 +201,166 @@ app.post('/render', async (req, res) => {
   }
 });
 
+// ===================== WORD-BY-WORD KARAOKE =====================
+// Uses Quran.com word-timing segments + ASS karaoke subtitles burned by FFmpeg (libass).
+
+function assColor(hex) {
+  const h = String(hex).replace('#', '');
+  const r = h.slice(0, 2), g = h.slice(2, 4), b = h.slice(4, 6);
+  return `&H00${b}${g}${r}`.toUpperCase();
+}
+function assTime(ms) {
+  const cs = Math.max(0, Math.round(ms / 10));
+  const h = Math.floor(cs / 360000);
+  const m = Math.floor((cs % 360000) / 6000);
+  const s = Math.floor((cs % 6000) / 100);
+  const c = cs % 100;
+  return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(c).padStart(2, '0')}`;
+}
+
+// Fetch words + audio URL + word-timing segments for one ayah from Quran.com.
+async function fetchVerseTiming(recitationId, key) {
+  const url = `https://api.quran.com/api/v4/verses/by_key/${key}?words=true&word_fields=text_uthmani&audio=${recitationId}`;
+  const r = await fetch(url, { headers: { Accept: 'application/json' } });
+  if (!r.ok) throw new Error(`quran.com ${r.status} for ${key}`);
+  const j = await r.json();
+  const v = j.verse || {};
+  const words = (v.words || [])
+    .filter((w) => (w.char_type_name || w.char_type) === 'word')
+    .map((w) => w.text_uthmani || w.text || '');
+  const audio = v.audio || {};
+  const audioUrl = audio.url ? (String(audio.url).startsWith('http') ? audio.url : 'https://verses.quran.com/' + audio.url) : null;
+  const segments = audio.segments || [];
+  return { words, audioUrl, segments };
+}
+
+app.post('/render-karaoke', async (req, res) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'qk-'));
+  try {
+    let {
+      recitationId = 7, verseKeys = [], background = 'nature',
+      width = 1080, height = 1920, color = '#d4b676', position = 'middle',
+    } = req.body || {};
+    if (!Array.isArray(verseKeys) || verseKeys.length === 0) {
+      return res.status(400).json({ error: 'verseKeys is required' });
+    }
+
+    let W = Math.max(360, Math.min(1080, parseInt(width) || 1080));
+    let H = Math.max(360, Math.min(1920, parseInt(height) || 1920));
+    const long = Math.max(W, H);
+    if (long > MAX_LONG_SIDE) {
+      const k = MAX_LONG_SIDE / long;
+      W = Math.round((W * k) / 2) * 2;
+      H = Math.round((H * k) / 2) * 2;
+    }
+
+    // 1) fetch timing + download each ayah's audio
+    const listLines = [];
+    const dialogues = [];
+    let offsetMs = 0;
+    for (let i = 0; i < verseKeys.length; i++) {
+      const { words, audioUrl, segments } = await fetchVerseTiming(recitationId, verseKeys[i]);
+      if (!audioUrl) throw new Error(`no audio for ${verseKeys[i]} (try another reciter)`);
+      const f = path.join(dir, `a${i}.mp3`);
+      await download(audioUrl, f);
+      listLines.push(`file '${f}'`);
+      const durMs = (await probeDuration(f)) * 1000;
+
+      // word index -> [startMs, endMs] (relative to this ayah)
+      const segByWord = {};
+      for (const s of segments) {
+        if (Array.isArray(s) && s.length >= 3) {
+          const idx = s[0];
+          if (idx >= 1) segByWord[idx] = [s[1], s[2]];
+        }
+      }
+      // build karaoke tokens; fall back to even split if timing is missing
+      const n = words.length || 1;
+      let cursor = 0;
+      const tokens = words.map((w, wi) => {
+        let st, en;
+        if (segByWord[wi + 1]) { [st, en] = segByWord[wi + 1]; }
+        else { st = (durMs * wi) / n; en = (durMs * (wi + 1)) / n; }
+        const lead = Math.max(0, Math.round((st - cursor) / 10));
+        const dur = Math.max(1, Math.round((en - st) / 10));
+        cursor = en;
+        return `${lead ? `{\\k${lead}}` : ''}{\\k${dur}}${w}`;
+      });
+      dialogues.push(`Dialogue: 0,${assTime(offsetMs)},${assTime(offsetMs + durMs)},AR,,0,0,0,,${tokens.join(' ')}`);
+      offsetMs += durMs;
+    }
+
+    await writeFile(path.join(dir, 'list.txt'), listLines.join('\n'));
+    const audio = path.join(dir, 'audio.mp3');
+    await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', path.join(dir, 'list.txt'), '-c:a', 'libmp3lame', audio]);
+    const totalSec = Math.max(1, offsetMs / 1000);
+
+    // 2) write the ASS karaoke file
+    const fontSize = Math.round(W * 0.075);
+    const align = position === 'top' ? 8 : position === 'bottom' ? 2 : 5;
+    const marginV = Math.round(H * 0.12);
+    const ass = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${W}
+PlayResY: ${H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: AR,Amiri,${fontSize},${assColor(color)},&H50FFFFFF,&H00000000,&H78000000,0,0,0,0,100,100,0,0,1,3,1,${align},60,60,${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${dialogues.join('\n')}
+`;
+    const assPath = path.join(dir, 'karaoke.ass');
+    await writeFile(assPath, ass);
+
+    // 3) background (Pexels or gradient)
+    const bg = path.join(dir, 'bg.mp4');
+    let haveBg = false;
+    if (PEXELS_KEY) {
+      try { await fetchPexels(background, W >= H ? 'landscape' : 'portrait', bg); haveBg = true; }
+      catch (e) { console.warn('Pexels fallback:', e.message); }
+    }
+
+    // 4) compose: background + dark scrim + burned karaoke subtitles + audio
+    const out = path.join(dir, 'out.mp4');
+    const assFilter = `subtitles=${assPath.replace(/\\/g, '/').replace(/:/g, '\\:')}`;
+    if (haveBg) {
+      await run('ffmpeg', [
+        '-y', '-stream_loop', '-1', '-i', bg, '-i', audio,
+        '-filter_complex',
+        `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,` +
+          `drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.4:t=fill,${assFilter}[v]`,
+        '-map', '[v]', '-map', '1:a', '-t', String(totalSec), '-r', '30',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out,
+      ]);
+    } else {
+      await run('ffmpeg', [
+        '-y',
+        '-f', 'lavfi', '-i',
+        `gradients=s=${W}x${H}:speed=0.006:c0=0x0d2018:c1=0x2f7d5f:c2=0x0a1411:c3=0xd4b676:d=${totalSec}:r=30`,
+        '-i', audio,
+        '-filter_complex', `[0:v]drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.32:t=fill,${assFilter}[v]`,
+        '-map', '[v]', '-map', '1:a', '-t', String(totalSec), '-r', '30',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out,
+      ]);
+    }
+
+    const buf = await readFile(out);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Disposition', 'attachment; filename="verse-karaoke.mp4"');
+    res.send(buf);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e?.message || e) });
+  } finally {
+    rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 app.listen(PORT, () => console.log(`Video server listening on ${PORT}`));
