@@ -108,6 +108,70 @@ async function renderOverlay({ arabic, translit, translation, W, H, out, arFacto
   }
 }
 
+// Build an ASS subtitle file from ready-made Dialogue lines and burn it over a
+// moving background (Pexels or gradient) together with the audio. Used for timed-block
+// captions (and word karaoke). No Chromium needed — libass shapes Arabic correctly.
+async function composeWithAss(dir, { W, H, color, position, fontSizePx, dialogues, audio, totalSec, background }) {
+  const align = position === 'top' ? 8 : position === 'bottom' ? 2 : 5;
+  const marginV = Math.round(H * 0.12);
+  const marginLR = Math.round(W * 0.07);
+  const ass = `[Script Info]
+ScriptType: v4.00+
+PlayResX: ${W}
+PlayResY: ${H}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: AR,Amiri,${fontSizePx},${assColor(color)},&H50FFFFFF,&H00000000,&H78000000,0,0,0,0,100,100,0,0,1,3,1,${align},${marginLR},${marginLR},${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${dialogues.join('\n')}
+`;
+  const assPath = path.join(dir, 'subs.ass');
+  await writeFile(assPath, ass);
+
+  const bg = path.join(dir, 'bg.mp4');
+  let haveBg = false;
+  if (PEXELS_KEY) {
+    try { await fetchPexels(background, W >= H ? 'landscape' : 'portrait', bg); haveBg = true; }
+    catch (e) { console.warn('Pexels fallback:', e.message); }
+  }
+
+  const out = path.join(dir, 'out.mp4');
+  const assFilter = `subtitles=${assPath.replace(/\\/g, '/').replace(/:/g, '\\:')}`;
+  if (haveBg) {
+    await run('ffmpeg', [
+      '-y', '-stream_loop', '-1', '-i', bg, '-i', audio,
+      '-filter_complex',
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,` +
+        `drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.4:t=fill,${assFilter}[v]`,
+      '-map', '[v]', '-map', '1:a', '-t', String(totalSec), '-r', '30',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out,
+    ]);
+  } else {
+    await run('ffmpeg', [
+      '-y',
+      '-f', 'lavfi', '-i',
+      `gradients=s=${W}x${H}:speed=0.006:c0=0x0d2018:c1=0x2f7d5f:c2=0x0a1411:c3=0xd4b676:d=${totalSec}:r=30`,
+      '-i', audio,
+      '-filter_complex', `[0:v]drawbox=x=0:y=0:w=${W}:h=${H}:color=black@0.32:t=fill,${assFilter}[v]`,
+      '-map', '[v]', '-map', '1:a', '-t', String(totalSec), '-r', '30',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads', '1', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', out,
+    ]);
+  }
+  return out;
+}
+
+// Escape text for an ASS event (newlines -> \N, strip braces).
+function assText(s) {
+  return String(s || '').replace(/[{}]/g, '').replace(/\r?\n/g, ' ').trim();
+}
+
 // ---------- routes ----------
 app.get('/', (_req, res) => res.send('Quran Captions video server is running.'));
 
@@ -119,9 +183,11 @@ app.post('/render', async (req, res) => {
       audioUrls = [], background = 'nature',
       width = 1080, height = 1920,
       arFactor = 0.064, position = 'middle', color = '#ffffff',
+      synced = false, lines = [],
     } = req.body || {};
 
-    if (!Array.isArray(audioUrls) || audioUrls.length === 0) {
+    const useSynced = synced && Array.isArray(lines) && lines.length > 0;
+    if (!useSynced && (!Array.isArray(audioUrls) || audioUrls.length === 0)) {
       return res.status(400).json({ error: 'audioUrls is required' });
     }
 
@@ -133,6 +199,38 @@ app.post('/render', async (req, res) => {
       const k = MAX_LONG_SIDE / long;
       W = Math.round((W * k) / 2) * 2;
       H = Math.round((H * k) / 2) * 2;
+    }
+
+    // ----- TIMED BLOCKS: each ayah shows for its own recitation window, then disappears -----
+    if (useSynced) {
+      const listLines = [];
+      const dialogues = [];
+      let offMs = 0;
+      for (let i = 0; i < lines.length; i++) {
+        const ln = lines[i];
+        const f = path.join(dir, `a${i}.mp3`);
+        await download(ln.audioUrl, f);
+        listLines.push(`file '${f}'`);
+        const durMs = (await probeDuration(f)) * 1000;
+        const parts = [];
+        if (ln.arabic) parts.push(assText(ln.arabic));
+        if (ln.translit) parts.push('{\\i1}' + assText(ln.translit) + '{\\i0}');
+        if (ln.translation) parts.push('\u201c' + assText(ln.translation) + '\u201d');
+        dialogues.push(`Dialogue: 0,${assTime(offMs)},${assTime(offMs + durMs)},AR,,0,0,0,,${parts.join('\\N')}`);
+        offMs += durMs;
+      }
+      await writeFile(path.join(dir, 'list.txt'), listLines.join('\n'));
+      const audioS = path.join(dir, 'audio.mp3');
+      await run('ffmpeg', ['-y', '-f', 'concat', '-safe', '0', '-i', path.join(dir, 'list.txt'), '-c:a', 'libmp3lame', audioS]);
+      const fontSizePx = Math.max(14, Math.round(W * (arFactor || 0.064)));
+      const out = await composeWithAss(dir, {
+        W, H, color, position, fontSizePx, dialogues,
+        audio: audioS, totalSec: Math.max(1, offMs / 1000), background,
+      });
+      const buf = await readFile(out);
+      res.setHeader('Content-Type', 'video/mp4');
+      res.setHeader('Content-Disposition', 'attachment; filename="verse.mp4"');
+      return res.send(buf);
     }
 
     // 1) download + concatenate the ayah audio
